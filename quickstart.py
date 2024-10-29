@@ -1,4 +1,4 @@
-import pandas as pd
+import pandas as pd 
 import lotus
 from lotus.models import OpenAIModel
 
@@ -6,7 +6,7 @@ from lotus.models import OpenAIModel
 lm = OpenAIModel()
 lotus.settings.configure(lm=lm)
 
-# create dataframes with course names and skills
+# create dataframes with course 
 courses_data = {
     "Course Name": [
         "History of the Atlantic World",
