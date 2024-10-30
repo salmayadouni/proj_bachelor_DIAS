@@ -2,86 +2,94 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-
+from typing import Any, List, Tuple, Dict
+import pandas as pd
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from sentence_transformers import SentenceTransformer, util
+import faiss
 import lotus
 from lotus.types import SemanticJoinOutput
 
 from .sem_filter import sem_filter
 
 
+
+# Load a lightweight model for embedding generation
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+def generate_embeddings(data: pd.Series, batch_size: int = 100) -> np.ndarray:
+    """Generate embeddings for a given pandas Series with batching."""
+    embeddings = [
+        model.encode(data[i:i + batch_size].tolist(), convert_to_tensor=False, show_progress_bar=False)
+        for i in range(0, len(data), batch_size)
+    ]
+    return np.vstack(embeddings)
+
+def apply_blocking_rule(text1: str, text2: str) -> bool:
+    """Simple heuristic blocking rule for initial filtering."""
+    return abs(len(text1) - len(text2)) < 10
+
 def sem_join(
-    l1: pd.Series,
-    l2: pd.Series,
-    ids1: list[int],
-    ids2: list[int],
-    col1_label: str,
-    col2_label: str,
-    model: lotus.models.LM,
-    user_instruction: str,
-    examples_df_txt: list[str] | None = None,
-    examples_answers: list[bool] | None = None,
-    cot_reasoning: list[str] | None = None,
-    default: bool = True,
-    strategy: str | None = None,
-) -> SemanticJoinOutput:
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    col1: str,
+    col2: str,
+    join_instruction: str,
+    threshold: float = 0.5,
+    k: int = 10,
+    max_threads: int = 4
+) -> pd.DataFrame:
     """
-    Joins two series using a model.
-
+    Perform optimized semantic join with parallel processing and FAISS indexing.
+    
     Args:
-        l1 (pd.Series): The first series.
-        l2 (pd.Series): The second series.
-        ids1 (list[int]): The ids for the first series.
-        ids2 (list[int]): The ids for the second series.
-        col1_label (str): The label for the first column.
-        col2_label (str): The label for the second column.
-        model (lotus.models.LM): The model to use.
-        user_instruction (str): The user instruction for join.
-        examples_df_txt (list[str] | None): The examples dataframe text. Defaults to None.
-        examples_answers (list[bool] | None): The answers for examples. Defaults to None.
-        cot_reasoning (list[str] | None): The reasoning for CoT. Defaults to None.
-        default (bool): The default value for the join in case of parsing errors. Defaults to True.
-
+        df1, df2 (pd.DataFrame): DataFrames to join.
+        col1, col2 (str): Columns to join on.
+        join_instruction (str): Instruction for the join.
+        threshold (float): Cosine similarity threshold.
+        k (int): Number of nearest neighbors to retrieve.
+        max_threads (int): Max threads for parallel processing.
+    
     Returns:
-        SemanticJoinOutput: The join results, filter outputs, all raw outputs, and all explanations.
+        pd.DataFrame: Joined DataFrame with similarity scores.
     """
-    filter_outputs = []
-    all_raw_outputs = []
-    all_explanations = []
+    # Generate embeddings for each series
+    embeddings1 = generate_embeddings(df1[col1])
+    embeddings2 = generate_embeddings(df2[col2])
 
-    join_results = []
+    # Convert embeddings to lower precision for faster processing
+    embeddings1 = embeddings1.astype('float16')
+    embeddings2 = embeddings2.astype('float16')
 
-    # for i1 in enumerate(l1):
-    for id1, i1 in zip(ids1, l1):
-        # perform llm filter
-        modified_docs = l2.apply(lambda doc: f"{col1_label}: {i1}\n{col2_label}: {doc}")
-        output = sem_filter(
-            modified_docs,
-            model,
-            user_instruction,
-            examples_df_txt=examples_df_txt,
-            examples_answers=examples_answers,
-            cot_reasoning=cot_reasoning,
-            default=default,
-            strategy=strategy,
-        )
-        outputs = output.outputs
-        raw_outputs = output.raw_outputs
-        explanations = output.explanations
+    # Create FAISS index with an IVF index for improved efficiency
+    d = embeddings2.shape[1]
+    nlist = 100  # Number of clusters
+    quantizer = faiss.IndexFlatIP(d)
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+    index.train(embeddings2)
+    index.add(embeddings2)
 
-        filter_outputs.extend(outputs)
-        all_raw_outputs.extend(raw_outputs)
-        all_explanations.extend(explanations)
+    # Function to process a chunk of embeddings
+    def process_chunk(start: int, end: int) -> List[Tuple[str, str, float]]:
+        results = []
+        similarities, indices = index.search(embeddings1[start:end], k)
+        for i, (sims, idxs) in enumerate(zip(similarities, indices), start):
+            for j, sim in zip(idxs, sims):
+                if sim >= threshold and apply_blocking_rule(df1[col1].iloc[i], df2[col2].iloc[j]):
+                    results.append((df1[col1].iloc[i], df2[col2].iloc[j], sim))
+        return results
 
-        join_results.extend(
-            [
-                (id1, ids2[i], explanation)
-                for i, (output, explanation) in enumerate(zip(outputs, explanations))
-                if output
-            ]
-        )
+    # Run chunks in parallel
+    batch_size = len(df1) // max_threads
+    with ThreadPoolExecutor(max_threads=max_threads) as executor:
+        futures = [
+            executor.submit(process_chunk, i, min(i + batch_size, len(df1)))
+            for i in range(0, len(df1), batch_size)
+        ]
+        results = [item for future in futures for item in future.result()]
 
-    lotus.logger.debug(f"outputs: {filter_outputs}")
-    lotus.logger.debug(f"explanations: {all_explanations}")
+    return pd.DataFrame(results, columns=[col1, col2, "similarity_score"])
 
     return SemanticJoinOutput(
         join_results=join_results,
